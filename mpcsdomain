@@ -1,0 +1,266 @@
+#!/usr/bin/env python
+
+# mpcsdomain: manage AWS subdomains for student homework
+#
+# Copyright (C) 2011-2019 Vas Vasiliadis
+# University of Chicago
+##
+
+import os
+import sys
+import time
+import boto3
+import argparse
+from argparse import RawTextHelpFormatter
+
+mpcs_domain = "mpcs-cc.com"
+mpcs_cc_hosted_zone_id = "Z07879352CEWYZQPH9CBS"
+
+def update_route53(service=None, region=None,
+  zone_id=None, action=None, subdomain=None,
+  ip_address=None, elb_name=None):
+
+  # Perform the requested action
+  if (elb_name is not None):
+    elb = boto3.client('elbv2', region_name=region)
+    elbs = elb.describe_load_balancers(Names=[elb_name])
+    if (len(elbs['LoadBalancers']) == 1):
+      elb = elbs['LoadBalancers'][0]
+    else:
+      # Ambiguous ELB situation
+      print("Found multiple ELBs! Something is very wrong...")
+      return
+
+    batch = {
+      'Comment': 'Cloud Computing class ELB assignment: ' + subdomain,
+      'Changes': [{
+        'Action': action,
+        'ResourceRecordSet': {
+          'Name': subdomain,
+          'Type': 'A',
+          'AliasTarget': {
+            'DNSName': elb['DNSName'],
+            'HostedZoneId': elb['CanonicalHostedZoneId'],
+            'EvaluateTargetHealth': False
+          }
+        }
+      }]
+    }
+  else:
+    batch = {
+      'Comment': 'Cloud Computing class subdomain: ' + subdomain,
+      'Changes': [{
+        'Action': action,
+        'ResourceRecordSet': {
+          'Name': subdomain,
+          'Type': 'A',
+          'TTL': 60,
+          'ResourceRecords': [
+            {
+              'Value': ip_address
+            }
+          ]
+        }
+      }]
+    }
+
+  try:
+    response = service.change_resource_record_sets(
+      HostedZoneId=zone_id,
+      ChangeBatch=batch)
+  except Exception as e:
+    return {'ResponseMetadata': {'HTTPStatusCode': 500}, 'error': str(e)}
+
+  return response
+
+
+def list_subdomains(service=None, zone_id=None, filter=None):
+  # Get a list of zone records matching the filter
+  response = service.list_resource_record_sets(HostedZoneId=zone_id)
+  record_sets = response['ResourceRecordSets']
+  while response['IsTruncated']:
+    response = service.list_resource_record_sets(HostedZoneId=zone_id,
+      StartRecordName=response['NextRecordName'])
+    record_sets.extend(response['ResourceRecordSets'])
+
+  subdomains = [{"name": r['Name'].rstrip('.'), "ip": r['ResourceRecords'][0]['Value']} \
+    for r in record_sets if filter in r['Name']]
+
+  # List any domain records found
+  for subdomain in subdomains:
+    print(f"{subdomain['name']} ({subdomain['ip']})")
+
+  print(f"Subdomain records found: {len(subdomains)}")
+
+
+def manage_subdomain(service=None, region=None,
+  zone_id=None, action=None,
+  subdomain=None, ip_address=None, elb_name=None):
+
+  response = update_route53(service=service, region=region,
+    zone_id=zone_id, action=action, subdomain=subdomain + "." + mpcs_domain,
+    ip_address=ip_address, elb_name=elb_name)
+
+  if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+    print(f"{action} succeeded; {subdomain}.mpcs-cc.com --> {ip_address if ip_address is not None else elb_name}")
+  else:
+    print(f"{action} failed for subdomain {subdomain}.mpcs-cc.com: {response['error']}")
+
+
+def cleanup_subdomains(service=None, zone_id=None, filter=None):
+  # Get a list of zone records matching the filter
+  response = service.list_resource_record_sets(HostedZoneId=zone_id)
+  record_sets = response['ResourceRecordSets']
+  while response['IsTruncated']:
+    response = service.list_resource_record_sets(HostedZoneId=zone_id,
+      StartRecordName=response['NextRecordName'])
+    record_sets.extend(response['ResourceRecordSets'])
+
+  subdomains = [{"name": r['Name'].rstrip('.'), "ip": r['ResourceRecords'][0]['Value']} \
+    for r in record_sets if (filter in r['Name'] and r['Type'] == 'A')]
+
+  # Delete any domain records found
+  print(f"{len(subdomains)} subdomain records will be removed")
+  for subdomain in subdomains:
+    print(f"Deleting {subdomain['name']}...")
+    response = update_route53(service=service, zone_id=zone_id, action='DELETE',
+      subdomain=subdomain['name'], ip_address=subdomain['ip'])
+
+    if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+      print(f"Removed subdomain {subdomain['name']} hosted at {subdomain['ip']}")
+    else:
+      print(f"Failed to clean up subdomain {subdomain['name']}: {response['error']}")
+
+
+def parse_options():
+
+  parser = argparse.ArgumentParser(prog='mpcsenv', description='''
+    MPCS Cloud Computing class DNS configuration
+    Use this command to create/update a DNS entry that associates a
+    subdomain with an EC2 instance.\n
+    To CREATE a subdomain:
+      1. From the public DNS name of your EC2 instance, note the
+         IP address portion. For example, if your instance is at
+         ec2-52-55-108-110.compute-1.amazonaws.com,
+         the IP address is 52.55.108.110.
+      2. Run: mpcsdomain create --subdomain <subdomain_name> --ip <IP_address>.
+         For example, to create a subdomain called "instructor-hw2.mpcs-cc.com"
+         at the above IP address you would run:
+         mpcsdomain create -subdomain instructor-hw2 -ip 52.55.108.110.
+         Note that you must only specify first part of the domain name
+         (do not include the mpcs-cc.com part)\n
+    To DELETE a subdomain:
+      Use the "delete" command, which takes the same parameters:
+      mpcsdomain delete --subdomain <subdomain> --ip <IP_address>\n
+    To UPDATE a subdomain:
+      Use the same parameters and specify the new IP address
+      e.g. if your instance's public DNS changes, you can update
+      the IP address of your subdomain with the command:
+      mpcsdomain update --subdomain <subdomain> --ip <new_IP_address>.
+      For example: mpcsdomain update -s instructor-hw2 -i 34.12.87.40\n
+    To associate an Elastic Load Balancer with your subdomain (during
+      the capstone project only) use the commands above and replace
+      --ip <IP_adress> with --elb <ELB_name>. For example:
+      mpcsdomain updste -subdomain instructor --elb instructor-elb''',
+      formatter_class=RawTextHelpFormatter)
+
+  parser.add_argument('--profile',
+    default=(os.environ['AWS_PROFILE'] if ('AWS_PROFILE' in os.environ) else 'default'),
+    help='The credentials profile name to use. Default: $AWS_PROFILE | default')
+  parser.add_argument('--region',
+    default=(os.environ['AWS_DEFAULT_REGION'] if ('AWS_DEFAULT_REGION' in os.environ) else 'us-east-1'),
+    help='The AWS region for the target environment. Default: $AWS_DEFAULT_REGION | us-east-1')
+  parser.add_argument('--zoneid', default=mpcs_cc_hosted_zone_id,
+    help='The zone ID for the Route 53 hosted zone. Default: Z07879352CEWYZQPH9CBS')
+  subparsers = parser.add_subparsers(title='Available commands', dest='command_name')
+
+  # Create the parser for the "list" command
+  parser_list = subparsers.add_parser('list',
+    help="Lists subdomains whose name includes the filter text.")
+  parser_list.add_argument('--filter', required=True,
+    help='Name of the subdomain (or text included in name) to list, \
+          e.g. "-hw1" lists all subdomains whose name contains "-hw1".')
+
+  # Create the parser for the "create" command
+  parser_create = subparsers.add_parser('create',
+    help='Creates a subdomain (A) record in Route 53.')
+  parser_create.add_argument('--subdomain', required=True,
+    help='The name of the subdomain to create, \
+    e.g. "instructor" creates instructor.mpcs-cc.com.')
+  parser_create.add_argument('--ip',
+    help='The public IP address to associate with the new subdomain.')
+  parser_create.add_argument('--elb',
+    help='The name of the Elastic Load Balancer to associate with the new subdomain.')
+
+  # Create the parser for the "delete" command
+  parser_delete = subparsers.add_parser('delete',
+    help='Deletes a subdomain in Route 53 and releases Elastic IP addresses.')
+  parser_delete.add_argument('--subdomain', required=True,
+    help='The name of the subdomain to delete, e.g. \
+    "cnetstudent-hw1" deletes cnetstudent-hw1.mpcs-cc.com.')
+  parser_delete.add_argument('--ip',
+    help='The public IP address associated with the subdomain.')
+  parser_delete.add_argument('--elb',
+    help='The name of the Elastic Load Balancer associated with the subdomain.')
+
+  # Create the parser for the "update" command
+  parser_update = subparsers.add_parser('update', help="Updates the subdomain's IP address.")
+  parser_update.add_argument('--subdomain', required=True,
+    help='The name of the subdomain to update, e.g. "mysubdomain" updates mysubdomain.mpcs-cc.com.')
+  parser_update.add_argument('--ip',
+    help='The new public IP address to associate with the subdomain.')
+  parser_update.add_argument('--elb',
+    help='The name of the Elastic Load Balancer to associate with the subdomain.')
+
+  # Create the parser for the "cleanup" command
+  parser_cleanup = subparsers.add_parser('cleanup',
+    help="Removes subdomains whose name includes the filter text.")
+  parser_cleanup.add_argument('--filter', required=True,
+    help='Name of the subdomain (or text included in name) to remove, \
+          e.g. "-hw1" removes all subdomains whose name contains "-hw4".')
+
+  args = parser.parse_args()
+  command = args.command_name
+  if (command in ['create', 'update', 'delete']):
+    # Either an IP address or an ELB DNS must be specified
+    if ((args.ip is not None) and (args.elb is not None)):
+      print("You cannot specify both --ip and --elb")
+      return
+    elif ((args.ip == None) and (args.elb == None)):
+      print("Either --ip <public_IP_address> or --elb <ELB_name> must be specified")
+      return
+
+  session = boto3.Session(profile_name=args.profile)
+
+  route53 = session.client('route53', region_name=args.region)
+
+  if (command == 'list'):
+    list_subdomains(service=route53,
+      zone_id=args.zoneid, filter=args.filter)
+  elif (command == 'create'):
+    manage_subdomain(service=route53, region=args.region,
+      zone_id=args.zoneid, action='CREATE',
+      subdomain=args.subdomain, ip_address=args.ip, elb_name=args.elb)
+  elif (command == 'delete'):
+    manage_subdomain(service=route53, region=args.region,
+      zone_id=args.zoneid, action='DELETE',
+      subdomain=args.subdomain, ip_address=args.ip, elb_name=args.elb)
+  elif (command == 'update'):
+    manage_subdomain(service=route53, region=args.region,
+      zone_id=args.zoneid, action='UPSERT',
+      subdomain=args.subdomain, ip_address=args.ip, elb_name=args.elb)
+  elif (command == 'cleanup'):
+    if (len(args.filter) == 0):
+      confirm = input("\nWARNING: This will delete all resoure records in\nthe specified zone. Please type 'DELETE' to confirm: ")
+      if (confirm != 'DELETE'):
+        print("No records were cleaned up")
+        return False
+    cleanup_subdomains(service=route53,
+      zone_id=args.zoneid, filter=args.filter)
+  else:
+    parser.print_usage()
+
+if __name__ == '__main__':
+  parse_options()
+
+### EOF
